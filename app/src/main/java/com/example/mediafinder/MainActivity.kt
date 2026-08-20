@@ -1,16 +1,24 @@
 package com.example.mediafinder
 
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -30,22 +38,27 @@ data class MediaItem(
     val id: String,
     val title: String,
     val previewUrl: String,
+    val sourceUrl: String,
     val source: String,
     val isVideo: Boolean
-)
+) {
+    val key: String get() = "$source:$id:${if (isVideo) "v" else "p"}"
+}
 
 interface PexelsApi {
     @GET("v1/search")
     suspend fun searchPhotos(
         @Header("Authorization") apiKey: String,
         @Query("query") query: String,
+        @Query("locale") locale: String = "ru-RU",
         @Query("per_page") perPage: Int = 30
     ): PexelsPhotoResponse
 
-    @GET("videos/search")
+    @GET("v1/videos/search")
     suspend fun searchVideos(
         @Header("Authorization") apiKey: String,
         @Query("query") query: String,
+        @Query("locale") locale: String = "ru-RU",
         @Query("per_page") perPage: Int = 30
     ): PexelsVideoResponse
 }
@@ -62,6 +75,7 @@ interface PixabayApi {
     suspend fun searchImages(
         @Query("key") key: String,
         @Query("q") query: String,
+        @Query("lang") lang: String = "ru",
         @Query("per_page") perPage: Int = 30
     ): PixabayImageResponse
 
@@ -69,6 +83,7 @@ interface PixabayApi {
     suspend fun searchVideos(
         @Query("key") key: String,
         @Query("q") query: String,
+        @Query("lang") lang: String = "ru",
         @Query("per_page") perPage: Int = 30
     ): PixabayVideoResponse
 }
@@ -78,7 +93,7 @@ data class PixabayImage(val id: Long, val pageURL: String, val previewURL: Strin
 data class PixabayVideoResponse(val hits: List<PixabayVideo> = emptyList())
 data class PixabayVideo(val id: Long, val pageURL: String, val videos: PixabayVideoFiles)
 data class PixabayVideoFiles(val medium: PixabayVideoFile?, val small: PixabayVideoFile?)
-data class PixabayVideoFile(val url: String?)
+data class PixabayVideoFile(val url: String?, val thumbnail: String? = null)
 
 class MediaRepository {
     private val pexels = Retrofit.Builder()
@@ -98,14 +113,14 @@ class MediaRepository {
             if (mode != "video") tasks += async {
                 runCatching {
                     pexels.searchPhotos(BuildConfig.PEXELS_API_KEY, query).photos.map {
-                        MediaItem(it.id.toString(), it.alt ?: "Pexels photo", it.src.medium, "Pexels", false)
+                        MediaItem(it.id.toString(), it.alt ?: "Фото Pexels", it.src.medium, it.url, "Pexels", false)
                     }
                 }.getOrDefault(emptyList())
             }
             if (mode != "photo") tasks += async {
                 runCatching {
                     pexels.searchVideos(BuildConfig.PEXELS_API_KEY, query).videos.map {
-                        MediaItem(it.id.toString(), it.user?.name ?: "Pexels video", it.image, "Pexels", true)
+                        MediaItem(it.id.toString(), it.user?.name ?: "Видео Pexels", it.image, it.url, "Pexels", true)
                     }
                 }.getOrDefault(emptyList())
             }
@@ -115,31 +130,39 @@ class MediaRepository {
             if (mode != "video") tasks += async {
                 runCatching {
                     pixabay.searchImages(BuildConfig.PIXABAY_API_KEY, query).hits.map {
-                        MediaItem(it.id.toString(), "Pixabay image", it.previewURL, "Pixabay", false)
+                        MediaItem(it.id.toString(), "Фото Pixabay", it.previewURL, it.pageURL, "Pixabay", false)
                     }
                 }.getOrDefault(emptyList())
             }
             if (mode != "photo") tasks += async {
                 runCatching {
                     pixabay.searchVideos(BuildConfig.PIXABAY_API_KEY, query).hits.mapNotNull {
-                        val url = it.videos.medium?.url ?: it.videos.small?.url
-                        url?.let { u -> MediaItem(it.id.toString(), "Pixabay video", u, "Pixabay", true) }
+                        val file = it.videos.medium ?: it.videos.small
+                        val url = file?.url
+                        url?.let { _ -> MediaItem(it.id.toString(), "Видео Pixabay", file.thumbnail ?: "", it.pageURL, "Pixabay", true) }
                     }
                 }.getOrDefault(emptyList())
             }
         }
 
-        tasks.awaitAll().flatten().distinctBy { "${it.source}:${it.id}:${it.isVideo}" }
+        tasks.awaitAll().flatten().distinctBy { it.key }
     }
 }
 
 class MainViewModel : ViewModel() {
     private val repository = MediaRepository()
+    private val prefs by lazy { AppPrefs.instance }
+
     var query by mutableStateOf("")
     var mode by mutableStateOf("all")
+    var section by mutableStateOf("search")
     var loading by mutableStateOf(false)
     var results by mutableStateOf<List<MediaItem>>(emptyList())
     var error by mutableStateOf<String?>(null)
+    var favorites by mutableStateOf<Set<String>>(emptySet())
+        private set
+
+    init { favorites = prefs.loadFavorites() }
 
     fun search() {
         if (query.isBlank()) return
@@ -148,16 +171,41 @@ class MainViewModel : ViewModel() {
             error = null
             results = repository.search(query.trim(), mode)
             if (results.isEmpty() && BuildConfig.PEXELS_API_KEY.isBlank() && BuildConfig.PIXABAY_API_KEY.isBlank()) {
-                error = "Добавь API-ключи Pexels и Pixabay в app/build.gradle.kts"
+                error = "Нужны API-ключи Pexels и Pixabay. Добавим их на следующем шаге."
+            } else if (results.isEmpty()) {
+                error = "Ничего не найдено. Попробуй другой запрос."
             }
             loading = false
         }
+    }
+
+    fun toggleFavorite(item: MediaItem) {
+        favorites = if (item.key in favorites) favorites - item.key else favorites + item.key
+        prefs.saveFavorites(favorites)
+    }
+}
+
+class AppPrefs private constructor(context: Context) {
+    private val prefs = context.getSharedPreferences("media_finder", Context.MODE_PRIVATE)
+
+    fun loadFavorites(): Set<String> = prefs.getStringSet("favorites", emptySet())?.toSet() ?: emptySet()
+
+    fun saveFavorites(values: Set<String>) {
+        prefs.edit().putStringSet("favorites", values).apply()
+    }
+
+    companion object {
+        lateinit var instance: AppPrefs
+            private set
+
+        fun init(context: Context) { instance = AppPrefs(context.applicationContext) }
     }
 }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        AppPrefs.init(applicationContext)
         setContent { MediaFinderApp() }
     }
 }
@@ -165,52 +213,93 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MediaFinderApp(vm: MainViewModel = viewModel()) {
+    val context = LocalContext.current
+    val visibleItems = if (vm.section == "favorites") vm.results.filter { it.key in vm.favorites } else vm.results
+
     MaterialTheme {
-        Scaffold(topBar = { TopAppBar(title = { Text("Media Finder") }) }) { padding ->
-            Column(Modifier.fillMaxSize().padding(padding).padding(12.dp)) {
-                OutlinedTextField(
-                    value = vm.query,
-                    onValueChange = { vm.query = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("Что ищем?") },
-                    singleLine = true
-                )
-                Spacer(Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(vm.mode == "all", { vm.mode = "all" }, "Все")
-                    FilterChip(vm.mode == "photo", { vm.mode = "photo" }, "Фото")
-                    FilterChip(vm.mode == "video", { vm.mode = "video" }, "Видео")
-                    Button(onClick = vm::search) { Text("Искать") }
+        Scaffold(
+            topBar = {
+                TopAppBar(title = { Text("Media Finder") })
+            },
+            bottomBar = {
+                NavigationBar {
+                    NavigationBarItem(vm.section == "search", { vm.section = "search" }, icon = { Text("🔎") }, label = { Text("Поиск") })
+                    NavigationBarItem(vm.section == "favorites", { vm.section = "favorites" }, icon = { Text("♥") }, label = { Text("Избранное") })
+                    NavigationBarItem(false, { }, icon = { Text("★") }, label = { Text("Премиум") }, enabled = false)
                 }
-                Spacer(Modifier.height(12.dp))
+            }
+        ) { padding ->
+            Column(Modifier.fillMaxSize().padding(padding).padding(12.dp)) {
+                if (vm.section == "search") {
+                    OutlinedTextField(
+                        value = vm.query,
+                        onValueChange = { vm.query = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Что ищем?") },
+                        placeholder = { Text("например: лес после дождя") },
+                        singleLine = true
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        FilterChip(vm.mode == "all", { vm.mode = "all" }, "Все")
+                        FilterChip(vm.mode == "photo", { vm.mode = "photo" }, "Фото")
+                        FilterChip(vm.mode == "video", { vm.mode = "video" }, "Видео")
+                        Button(onClick = vm::search, enabled = !vm.loading) { Text("Искать") }
+                    }
+                    Spacer(Modifier.height(10.dp))
+                } else {
+                    Text("Избранное", style = MaterialTheme.typography.headlineSmall)
+                    Spacer(Modifier.height(10.dp))
+                }
+
                 if (vm.loading) LinearProgressIndicator(Modifier.fillMaxWidth())
                 vm.error?.let {
                     Text(it, color = MaterialTheme.colorScheme.error)
                     Spacer(Modifier.height(8.dp))
                 }
+
                 LazyVerticalGrid(
                     columns = GridCells.Fixed(2),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.fillMaxSize()
                 ) {
-                    items(vm.results) { item ->
-                        Card {
-                            Column {
-                                AsyncImage(
-                                    model = item.previewUrl,
-                                    contentDescription = item.title,
-                                    modifier = Modifier.fillMaxWidth().height(180.dp),
-                                    contentScale = ContentScale.Crop
-                                )
-                                Text(
-                                    "${item.source} • ${if (item.isVideo) "Видео" else "Фото"}",
-                                    modifier = Modifier.padding(8.dp),
-                                    style = MaterialTheme.typography.labelMedium
-                                )
+                    items(visibleItems) { item ->
+                        MediaCard(
+                            item = item,
+                            favorite = item.key in vm.favorites,
+                            onFavorite = { vm.toggleFavorite(item) },
+                            onOpen = {
+                                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(item.sourceUrl)))
                             }
-                        }
+                        )
                     }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun MediaCard(item: MediaItem, favorite: Boolean, onFavorite: () -> Unit, onOpen: () -> Unit) {
+    Card(Modifier.clickable(onClick = onOpen)) {
+        Column {
+            AsyncImage(
+                model = item.previewUrl.ifBlank { null },
+                contentDescription = item.title,
+                modifier = Modifier.fillMaxWidth().height(180.dp),
+                contentScale = ContentScale.Crop
+            )
+            Row(Modifier.fillMaxWidth().padding(start = 8.dp, end = 4.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+                Column(Modifier.weight(1f).padding(vertical = 7.dp)) {
+                    Text(item.source, style = MaterialTheme.typography.labelLarge)
+                    Text(if (item.isVideo) "Видео" else "Фото", style = MaterialTheme.typography.labelSmall)
+                }
+                IconButton(onClick = onFavorite) {
+                    Icon(
+                        imageVector = if (favorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
+                        contentDescription = "Избранное"
+                    )
                 }
             }
         }
